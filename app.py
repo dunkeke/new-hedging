@@ -160,7 +160,15 @@ class HedgeMatchingEngine:
         
         df_paper_filtered = df_paper_filtered.sort_values(by='Trade Date').reset_index(drop=True)
         df_paper_filtered['Group_Key'] = df_paper_filtered['Std_Commodity'] + "_" + df_paper_filtered['Month']
-        records = df_paper_filtered.to_dict('records')
+        
+        # 创建副本，避免在迭代中修改原始记录的问题
+        records = []
+        for idx, row in df_paper_filtered.iterrows():
+            record = row.to_dict()
+            # 确保Close_Events是列表
+            record['Close_Events'] = []
+            records.append(record)
+        
         groups = {}
         
         # 分组
@@ -182,7 +190,6 @@ class HedgeMatchingEngine:
                 current_vol = row.get('Volume', 0)
                 records[idx]['Net_Open_Vol'] = current_vol
                 records[idx]['Closed_Vol'] = 0
-                records[idx]['Close_Events'] = []
                 
                 if abs(current_vol) < 0.0001:
                     continue
@@ -233,6 +240,22 @@ class HedgeMatchingEngine:
         st.success(f"✅ 纸货内部对冲完成！共处理 {len(groups)} 个商品-月份组合")
         return pd.DataFrame(records)
     
+    def prepare_dataframe_for_operations(self, df):
+        """准备数据框用于操作，确保没有不可哈希的类型"""
+        df_copy = df.copy()
+        
+        # 将Close_Events列表转换为字符串表示，以便去重操作
+        if 'Close_Events' in df_copy.columns:
+            df_copy['Close_Events_Str'] = df_copy['Close_Events'].apply(
+                lambda x: json.dumps(x) if isinstance(x, list) else str(x)
+            )
+            # 创建一个不带Close_Events列的数据框用于去重
+            df_for_ops = df_copy.drop(columns=['Close_Events'])
+        else:
+            df_for_ops = df_copy
+        
+        return df_for_ops
+    
     def match_hedges(self, df_physical, df_paper_net, designation_date):
         """实货匹配 - 根据新需求更新"""
         st.info("🔄 开始实货匹配...")
@@ -242,6 +265,7 @@ class HedgeMatchingEngine:
         open_positions = []  # 记录开仓头寸
         close_positions = []  # 记录平仓头寸
         
+        # 准备纸货数据用于操作
         active_paper = df_paper_net.copy()
         active_paper['Allocated_To_Phy'] = 0.0
         active_paper['_original_index'] = active_paper.index
@@ -332,7 +356,17 @@ class HedgeMatchingEngine:
                     if len(all_same_commodity) > 0:
                         # 按时间排序（FIFO）
                         all_same_commodity = all_same_commodity.sort_values('Trade Date')
-                        candidates_df = pd.concat([candidates_df, all_same_commodity]).drop_duplicates()
+                        # 使用基于索引的合并来避免list类型问题
+                        if not candidates_df.empty:
+                            # 获取候选数据框的索引
+                            candidates_indices = set(candidates_df.index)
+                            all_indices = set(all_same_commodity.index)
+                            # 合并索引
+                            combined_indices = candidates_indices.union(all_indices)
+                            # 获取合并后的数据
+                            candidates_df = active_paper.loc[list(combined_indices)].copy()
+                        else:
+                            candidates_df = all_same_commodity
             
             if candidates_df.empty:
                 continue
@@ -494,7 +528,7 @@ class HedgeMatchingEngine:
         summary['头寸类型'] = position_type
         return summary
     
-    def run_matching(self, df_paper_raw, df_physical_raw, designation_date="2024-11-12"):
+    def run_matching(self, df_paper_raw, df_physical_raw, designation_date="2025-11-12"):
         """执行完整匹配流程"""
         try:
             # 数据预处理
@@ -577,6 +611,12 @@ class HedgeMatchingEngine:
             paper_count = len(df_paper)
             st.info(f"纸货交易总数: {paper_count}")
             st.info(f"指定匹配开始日期: {designation_date}")
+            
+            # 检查指定日期之后的交易
+            if 'Trade Date' in df_paper.columns:
+                designation_dt = pd.to_datetime(designation_date)
+                valid_paper = df_paper[df_paper['Trade Date'] >= designation_dt]
+                st.info(f"指定日期之后的纸货交易数: {len(valid_paper)}")
             
             # 执行匹配
             self.df_paper_net = self.calculate_net_positions(df_paper, designation_date)
@@ -824,10 +864,10 @@ def main():
         st.markdown("---")
         st.markdown("### ⚙️ 匹配设置")
         
-        # 指定日期设置
+        # 指定日期设置 - 修正为2025年
         designation_date = st.date_input(
             "指定匹配开始日期",
-            value=datetime(2024, 11, 12),
+            value=datetime(2025, 11, 12),  # 修正为2025年
             help="从该日期开始的纸货交易才会参与匹配"
         )
         
@@ -1002,6 +1042,12 @@ def main():
                         if not analysis.open_summary.empty:
                             st.dataframe(analysis.open_summary, use_container_width=True)
                             st.caption(f"开仓头寸汇总 ({len(analysis.open_summary)}个商品-月份组合)")
+                            
+                            # 显示开仓加权平均价格
+                            st.subheader("开仓加权平均价格汇总")
+                            for _, row in analysis.open_summary.iterrows():
+                                st.write(f"**{row['Commodity']} - {row['Month']}**: "
+                                        f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
                         else:
                             st.info("无开仓头寸数据")
                     
@@ -1009,6 +1055,12 @@ def main():
                         if not analysis.close_summary.empty:
                             st.dataframe(analysis.close_summary, use_container_width=True)
                             st.caption(f"平仓头寸汇总 ({len(analysis.close_summary)}个商品-月份组合)")
+                            
+                            # 显示平仓加权平均价格
+                            st.subheader("平仓加权平均价格汇总")
+                            for _, row in analysis.close_summary.iterrows():
+                                st.write(f"**{row['Commodity']} - {row['Month']}**: "
+                                        f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
                         else:
                             st.info("无平仓头寸数据")
                 else:
@@ -1105,7 +1157,7 @@ def main():
                    - 实货持仓数据 (包含Cargo_ID、交易量、套保代理、目标月份等)
                 
                 2. **智能匹配 (按新规则)**
-                   - **时间过滤**: 仅匹配指定日期(11月12日)之后的纸货交易
+                   - **时间过滤**: 仅匹配指定日期(2025年11月12日)之后的纸货交易
                    - **优先级1**: BRENT计价品种优先，JCC次之
                    - **优先级2**: 实货按 phy-2026-04 → 05 → 01 → 02 → 03 顺序匹配
                    - **头寸区分**: 正数为开仓，负数为平仓
