@@ -352,15 +352,10 @@ class HedgeMatchingEngine:
                     if len(all_same_commodity) > 0:
                         # 按时间排序（FIFO）
                         all_same_commodity = all_same_commodity.sort_values('Trade Date')
-                        # 使用基于索引的合并来避免list类型问题
                         if not candidates_df.empty:
-                            # 获取候选数据框的索引
-                            candidates_indices = set(candidates_df.index)
-                            all_indices = set(all_same_commodity.index)
-                            # 合并索引
-                            combined_indices = candidates_indices.union(all_indices)
-                            # 获取合并后的数据
-                            candidates_df = active_paper.loc[list(combined_indices)].copy()
+                            combined_df = pd.concat([candidates_df, all_same_commodity])
+                            combined_df = self.prepare_dataframe_for_operations(combined_df)
+                            candidates_df = combined_df.drop_duplicates()
                         else:
                             candidates_df = all_same_commodity
             
