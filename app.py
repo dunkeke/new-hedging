@@ -31,20 +31,32 @@ class HedgeMatchingEngine:
         self.close_positions_summary = None  # 平仓汇总
         
     def clean_str(self, series):
-        """清洗字符串"""
-        return series.astype(str).str.strip().str.upper().replace('NAN', '')
+        """清洗字符串 - 处理NaN和float值"""
+        # 先转换为字符串，处理NaN
+        series = series.copy()
+        series = series.fillna('')
+        
+        # 转换为字符串并处理
+        return series.astype(str).str.strip().str.upper().replace('NAN', '').replace('NONE', '')
     
     def standardize_month(self, series):
-        """标准化月份格式"""
-        s = series.astype(str).str.strip().str.upper()
+        """标准化月份格式 - 增强错误处理"""
+        if series.empty:
+            return pd.Series([], dtype=str)
+            
+        s = series.copy()
+        s = s.fillna('')
+        s = s.astype(str).str.strip().str.upper()
         s = s.str.replace('-', ' ', regex=False).str.replace('/', ' ', regex=False)
-        dates = pd.to_datetime(s, errors='coerce')
+        dates = pd.to_datetime(s, errors='coerce', format='mixed')
         result = dates.dt.strftime('%b %y').str.upper()
         mask_invalid = dates.isna()
         
         if mask_invalid.any():
             invalid = s[mask_invalid]
             def swap_if_match(val):
+                if not isinstance(val, str):
+                    return val
                 m = re.match(r'^(\d{2})\s*([A-Z]{3})$', val)
                 if m:
                     yr, mon = m.groups()
@@ -55,7 +67,56 @@ class HedgeMatchingEngine:
             swapped_formatted = swapped_dates.dt.strftime('%b %y').str.upper()
             result.loc[mask_invalid & swapped_dates.notna()] = swapped_formatted.loc[swapped_dates.notna()]
             result.loc[mask_invalid & swapped_dates.isna()] = swapped.loc[swapped_dates.isna()]
+        
+        # 填充空值
+        result = result.fillna('')
         return result
+    
+    def safe_upper(self, value):
+        """安全的字符串大写转换"""
+        if pd.isna(value):
+            return ''
+        if isinstance(value, (int, float)):
+            return str(value)
+        return str(value).upper()
+    
+    def get_physical_priority(self, cargo_id):
+        """获取实货匹配优先级 - 增强错误处理"""
+        if pd.isna(cargo_id):
+            return 100
+            
+        # 安全转换为字符串
+        cargo_id_str = self.safe_upper(str(cargo_id))
+        
+        # 按照你的要求：phy-2026-04 -> phy-2026-05 -> phy-2026-01 -> phy-2026-02 -> phy-2026-03
+        priority_map = {
+            'PHY-2026-04': 1,
+            'PHY-2026-05': 2,
+            'PHY-2026-01': 3,
+            'PHY-2026-02': 4,
+            'PHY-2026-03': 5
+        }
+        
+        # 匹配 cargo_id 中的关键部分
+        for key in priority_map:
+            if key in cargo_id_str:
+                return priority_map[key]
+        
+        # 如果没有匹配到，返回默认值
+        return 100
+    
+    def get_commodity_priority(self, commodity):
+        """获取商品优先级：BRENT优先，JCC次之"""
+        if pd.isna(commodity):
+            return 3
+            
+        commodity_str = self.safe_upper(str(commodity))
+        if 'BRENT' in commodity_str:
+            return 1
+        elif 'JCC' in commodity_str:
+            return 2
+        else:
+            return 3
     
     def calculate_net_positions(self, df_paper, designation_date):
         """FIFO净仓计算 - 过滤指定日期前的交易"""
@@ -64,9 +125,12 @@ class HedgeMatchingEngine:
         
         # 过滤指定日期之前的交易（不参与匹配）
         df_paper_filtered = df_paper.copy()
-        df_paper_filtered['Trade Date'] = pd.to_datetime(df_paper_filtered['Trade Date'], errors='coerce')
         
-        if designation_date:
+        # 确保Trade Date是datetime类型
+        if 'Trade Date' in df_paper_filtered.columns:
+            df_paper_filtered['Trade Date'] = pd.to_datetime(df_paper_filtered['Trade Date'], errors='coerce')
+        
+        if designation_date and 'Trade Date' in df_paper_filtered.columns:
             designation_dt = pd.to_datetime(designation_date)
             before_mask = df_paper_filtered['Trade Date'] < designation_dt
             if before_mask.any():
@@ -152,35 +216,6 @@ class HedgeMatchingEngine:
         st.success(f"✅ 纸货内部对冲完成！共处理 {len(groups)} 个商品-月份组合")
         return pd.DataFrame(records)
     
-    def get_physical_priority(self, cargo_id):
-        """获取实货匹配优先级"""
-        # 按照你的要求：phy-2026-04 -> phy-2026-05 -> phy-2026-01 -> phy-2026-02 -> phy-2026-03
-        priority_map = {
-            'PHY-2026-04': 1,
-            'PHY-2026-05': 2,
-            'PHY-2026-01': 3,
-            'PHY-2026-02': 4,
-            'PHY-2026-03': 5
-        }
-        
-        # 匹配 cargo_id 中的关键部分
-        for key in priority_map:
-            if key in cargo_id.upper():
-                return priority_map[key]
-        
-        # 如果没有匹配到，返回默认值
-        return 100
-    
-    def get_commodity_priority(self, commodity):
-        """获取商品优先级：BRENT优先，JCC次之"""
-        commodity_upper = str(commodity).upper()
-        if 'BRENT' in commodity_upper:
-            return 1
-        elif 'JCC' in commodity_upper:
-            return 2
-        else:
-            return 3
-    
     def match_hedges(self, df_physical, df_paper_net, designation_date):
         """实货匹配 - 根据新需求更新"""
         st.info("🔄 开始实货匹配...")
@@ -196,6 +231,23 @@ class HedgeMatchingEngine:
         
         df_phy = df_physical.copy()
         df_phy['_orig_idx'] = df_phy.index
+        
+        # 数据清洗和验证
+        st.info("🔄 数据清洗和验证中...")
+        
+        # 检查必要字段
+        required_fields = ['Cargo_ID', 'Unhedged_Volume']
+        for field in required_fields:
+            if field not in df_phy.columns:
+                st.error(f"实货数据缺少必要字段: {field}")
+                return pd.DataFrame(), df_physical
+        
+        # 确保数据格式正确
+        df_phy['Cargo_ID'] = df_phy['Cargo_ID'].fillna('').astype(str)
+        df_phy['Unhedged_Volume'] = pd.to_numeric(df_phy['Unhedged_Volume'], errors='coerce').fillna(0)
+        
+        if 'Hedge_Proxy' in df_phy.columns:
+            df_phy['Hedge_Proxy'] = df_phy['Hedge_Proxy'].fillna('').astype(str)
         
         # 按优先级排序实货
         # 1. 商品优先级：BRENT优先
@@ -223,34 +275,47 @@ class HedgeMatchingEngine:
         total_cargos = len(df_phy)
         
         for idx, (_, cargo) in enumerate(df_phy.iterrows()):
-            cargo_id = cargo.get('Cargo_ID')
-            phy_vol = cargo.get('Unhedged_Volume', 0)
+            cargo_id = str(cargo.get('Cargo_ID', ''))
+            phy_vol = float(cargo.get('Unhedged_Volume', 0))
             
             if abs(phy_vol) < 0.0001:
                 continue
             
             proxy = str(cargo.get('Hedge_Proxy', ''))
-            target_month = cargo.get('Target_Contract_Month', None)
+            target_month = cargo.get('Target_Contract_Month', '')
             phy_dir = cargo.get('Direction', 'Buy')
             desig_date = cargo.get('Designation_Date', pd.NaT)
             
             # 筛选候选交易 - 优先匹配相同品种和月份
-            candidates_df = active_paper[
-                (active_paper['Std_Commodity'].str.contains(proxy, regex=False)) &
-                (active_paper['Month'] == target_month)
-            ].copy()
+            candidates_df = active_paper.copy()
+            
+            # 安全处理字符串匹配
+            if proxy:
+                mask = candidates_df['Std_Commodity'].apply(
+                    lambda x: proxy.upper() in self.safe_upper(x)
+                )
+                candidates_df = candidates_df[mask].copy()
+            
+            if not candidates_df.empty and target_month:
+                month_mask = candidates_df['Month'].apply(
+                    lambda x: str(target_month).upper() == self.safe_upper(x)
+                )
+                candidates_df = candidates_df[month_mask].copy()
             
             # 如果同月份不够，尝试匹配其他月份的相同品种
             if candidates_df.empty or candidates_df['Net_Open_Vol'].abs().sum() < abs(phy_vol):
                 # 查找相同品种的所有交易
-                all_same_commodity = active_paper[
-                    active_paper['Std_Commodity'].str.contains(proxy, regex=False)
-                ].copy()
-                
-                if len(all_same_commodity) > 0:
-                    # 按时间排序（FIFO）
-                    all_same_commodity = all_same_commodity.sort_values('Trade Date')
-                    candidates_df = pd.concat([candidates_df, all_same_commodity]).drop_duplicates()
+                if proxy:
+                    all_same_commodity = active_paper[
+                        active_paper['Std_Commodity'].apply(
+                            lambda x: proxy.upper() in self.safe_upper(x)
+                        )
+                    ].copy()
+                    
+                    if len(all_same_commodity) > 0:
+                        # 按时间排序（FIFO）
+                        all_same_commodity = all_same_commodity.sort_values('Trade Date')
+                        candidates_df = pd.concat([candidates_df, all_same_commodity]).drop_duplicates()
             
             if candidates_df.empty:
                 continue
@@ -271,8 +336,8 @@ class HedgeMatchingEngine:
                 
                 original_index = ticket['_original_index']
                 curr_allocated = active_paper.at[original_index, 'Allocated_To_Phy']
-                curr_total_vol = ticket.get('Volume', 0)
-                curr_net_open = ticket.get('Net_Open_Vol', 0)
+                curr_total_vol = float(ticket.get('Volume', 0))
+                curr_net_open = float(ticket.get('Net_Open_Vol', 0))
                 avail = curr_net_open - curr_allocated
                 
                 if abs(avail) < 0.0001:
@@ -286,9 +351,9 @@ class HedgeMatchingEngine:
                 active_paper.at[original_index, 'Allocated_To_Phy'] += alloc_amt
                 
                 # 记录开仓和平仓
-                ticket_commodity = ticket.get('Std_Commodity')
-                ticket_month = ticket.get('Month')
-                open_price = ticket.get('Price', 0)
+                ticket_commodity = str(ticket.get('Std_Commodity', ''))
+                ticket_month = str(ticket.get('Month', ''))
+                open_price = float(ticket.get('Price', 0))
                 
                 if alloc_amt > 0:  # 开仓
                     open_positions.append({
@@ -298,7 +363,7 @@ class HedgeMatchingEngine:
                         'Open_Date': ticket.get('Trade Date'),
                         'Volume': alloc_amt,
                         'Price': open_price,
-                        'Ticket_ID': ticket.get('Recap No')
+                        'Ticket_ID': str(ticket.get('Recap No', ''))
                     })
                 elif alloc_amt < 0:  # 平仓
                     close_positions.append({
@@ -308,12 +373,12 @@ class HedgeMatchingEngine:
                         'Close_Date': ticket.get('Trade Date'),
                         'Volume': alloc_amt,  # 负数
                         'Price': open_price,
-                        'Ticket_ID': ticket.get('Recap No')
+                        'Ticket_ID': str(ticket.get('Recap No', ''))
                     })
                 
                 # 计算财务指标
-                mtm_price = ticket.get('Mtm Price', open_price)
-                total_pl_raw = ticket.get('Total P/L', 0)
+                mtm_price = float(ticket.get('Mtm Price', open_price))
+                total_pl_raw = float(ticket.get('Total P/L', 0))
                 close_events = ticket.get('Close_Events', [])
                 
                 # 格式化平仓路径
@@ -338,13 +403,13 @@ class HedgeMatchingEngine:
                     'Designation_Date': desig_date,
                     'Open_Date': ticket.get('Trade Date'),
                     'Time_Lag': ticket.get('Time_Lag_Days'),
-                    'Ticket_ID': ticket.get('Recap No'),
-                    'Month': ticket.get('Month'),
+                    'Ticket_ID': str(ticket.get('Recap No', '')),
+                    'Month': ticket_month,
                     'Commodity': ticket_commodity,
                     'Allocated_Vol': alloc_amt,  # 正数为开仓，负数为平仓
-                    'Trade_Volume': ticket.get('Volume', 0),
-                    'Trade_Net_Open': ticket.get('Net_Open_Vol', 0),
-                    'Trade_Closed_Vol': ticket.get('Closed_Vol', 0),
+                    'Trade_Volume': curr_total_vol,
+                    'Trade_Net_Open': curr_net_open,
+                    'Trade_Closed_Vol': float(ticket.get('Closed_Vol', 0)),
                     'Open_Price': open_price,
                     'MTM_Price': mtm_price,
                     'Alloc_Unrealized_MTM': round(unrealized_mtm, 2),
@@ -365,11 +430,18 @@ class HedgeMatchingEngine:
         df_paper_net.update(cols_to_update)
         
         # 计算开仓和平仓汇总
-        self.open_positions_summary = self.calculate_weighted_average(open_positions, '开仓')
-        self.close_positions_summary = self.calculate_weighted_average(close_positions, '平仓')
+        if open_positions:
+            self.open_positions_summary = self.calculate_weighted_average(open_positions, '开仓')
+        else:
+            self.open_positions_summary = pd.DataFrame()
+            
+        if close_positions:
+            self.close_positions_summary = self.calculate_weighted_average(close_positions, '平仓')
+        else:
+            self.close_positions_summary = pd.DataFrame()
         
         progress_bar.progress(1.0)
-        df_relations = pd.DataFrame(hedge_relations)
+        df_relations = pd.DataFrame(hedge_relations) if hedge_relations else pd.DataFrame()
         st.success(f"✅ 实货匹配完成！共生成 {len(df_relations)} 条匹配记录")
         
         return df_relations, df_physical
@@ -387,11 +459,15 @@ class HedgeMatchingEngine:
         else:
             df['Volume_Abs'] = df['Volume']
         
+        # 确保数值类型
+        df['Volume_Abs'] = pd.to_numeric(df['Volume_Abs'], errors='coerce').fillna(0)
+        df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(0)
+        
         # 按商品和月份分组计算加权平均
         summary = df.groupby(['Commodity', 'Month']).apply(
             lambda x: pd.Series({
                 '总数量': x['Volume_Abs'].sum(),
-                '加权平均价格': np.average(x['Price'], weights=x['Volume_Abs']),
+                '加权平均价格': np.average(x['Price'], weights=x['Volume_Abs']) if x['Volume_Abs'].sum() > 0 else 0,
                 '交易次数': len(x),
                 '最早交易日期': x.iloc[0]['Open_Date'] if position_type == '开仓' else x.iloc[0]['Close_Date'],
                 '最晚交易日期': x.iloc[-1]['Open_Date'] if position_type == '开仓' else x.iloc[-1]['Close_Date']
@@ -470,11 +546,24 @@ class HedgeMatchingEngine:
         else:
             df_physical['Designation_Date'] = pd.NaT
         
+        # 数据验证
+        st.info("🔄 数据验证中...")
+        
+        # 检查实货Cargo_ID
+        if 'Cargo_ID' in df_physical.columns:
+            df_physical['Cargo_ID'] = df_physical['Cargo_ID'].fillna('').astype(str)
+            st.info(f"实货Cargo_ID数量: {len(df_physical['Cargo_ID'].unique())}")
+        
+        # 检查纸货数据
+        st.info(f"纸货交易总数: {len(df_paper)}")
+        st.info(f"指定匹配开始日期: {designation_date}")
+        
         # 执行匹配
         self.df_paper_net = self.calculate_net_positions(df_paper, designation_date)
         
         if self.df_paper_net.empty:
-            return None, None, None, None, None, None
+            st.warning("纸货净仓数据为空，请检查数据或调整指定日期")
+            return pd.DataFrame(), df_physical, pd.DataFrame(), df_paper, pd.DataFrame(), pd.DataFrame()
         
         self.df_relations, self.df_physical_updated = self.match_hedges(
             df_physical, self.df_paper_net, designation_date
@@ -493,22 +582,43 @@ class HedgeAnalysis:
     
     def __init__(self, df_relations, df_physical, df_paper_net, 
                  open_summary=None, close_summary=None):
-        self.df_relations = df_relations
-        self.df_physical = df_physical
-        self.df_paper_net = df_paper_net
-        self.open_summary = open_summary
-        self.close_summary = close_summary
+        self.df_relations = df_relations if df_relations is not None else pd.DataFrame()
+        self.df_physical = df_physical if df_physical is not None else pd.DataFrame()
+        self.df_paper_net = df_paper_net if df_paper_net is not None else pd.DataFrame()
+        self.open_summary = open_summary if open_summary is not None else pd.DataFrame()
+        self.close_summary = close_summary if close_summary is not None else pd.DataFrame()
         self.summary_stats = {}
         self.calculate_summary()
     
     def calculate_summary(self):
         """计算汇总统计"""
         if self.df_relations.empty:
+            self.summary_stats = {
+                'total_matched': 0,
+                'total_physical': 0,
+                'match_rate': 0,
+                'open_volume': 0,
+                'close_volume': 0,
+                'total_pl': 0,
+                'total_unrealized': 0,
+                'matched_cargos': 0,
+                'total_cargos': 0,
+                'total_tickets': 0,
+                'open_count': 0,
+                'close_count': 0,
+                'avg_time_lag': 0,
+                'std_time_lag': 0
+            }
             return
         
         # 匹配统计
         total_matched = abs(self.df_relations['Allocated_Vol']).sum()
-        total_physical = abs(self.df_physical['Volume']).sum() if 'Volume' in self.df_physical.columns else 0
+        
+        if 'Volume' in self.df_physical.columns:
+            total_physical = abs(self.df_physical['Volume']).sum()
+        else:
+            total_physical = 0
+            
         match_rate = (total_matched / total_physical * 100) if total_physical > 0 else 0
         
         # 开仓平仓统计
@@ -519,11 +629,11 @@ class HedgeAnalysis:
         close_volume = abs(close_positions['Allocated_Vol'].sum()) if not close_positions.empty else 0
         
         # 财务统计
-        total_pl = self.df_relations['Alloc_Total_PL'].sum()
-        total_unrealized = self.df_relations['Alloc_Unrealized_MTM'].sum()
+        total_pl = self.df_relations['Alloc_Total_PL'].sum() if 'Alloc_Total_PL' in self.df_relations.columns else 0
+        total_unrealized = self.df_relations['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in self.df_relations.columns else 0
         
         # 数量统计
-        matched_cargos = self.df_relations['Cargo_ID'].nunique()
+        matched_cargos = self.df_relations['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_relations.columns else 0
         total_cargos = self.df_physical['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_physical.columns else 0
         total_tickets = len(self.df_relations)
         
@@ -573,55 +683,6 @@ class HedgeAnalysis:
         with col4:
             st.metric("⚖️ 开仓/平仓", f"{stats['open_volume']:,.0f}/{stats['close_volume']:,.0f}",
                      delta=f"{stats['open_count']}/{stats['close_count']}笔")
-    
-    def create_match_volume_chart(self):
-        """匹配量分布图表"""
-        if self.df_relations.empty:
-            return None
-        
-        # 按Cargo_ID和头寸类型汇总
-        cargo_summary = self.df_relations.copy()
-        cargo_summary['Allocated_Vol_Abs'] = abs(cargo_summary['Allocated_Vol'])
-        cargo_summary = cargo_summary.groupby(['Cargo_ID', 'Position_Type'])['Allocated_Vol_Abs'].sum().reset_index()
-        
-        fig = px.bar(cargo_summary.sort_values('Allocated_Vol_Abs', ascending=False).head(40), 
-                     x='Cargo_ID', y='Allocated_Vol_Abs',
-                     color='Position_Type',
-                     title='📈 各Cargo_ID匹配量分布',
-                     labels={'Allocated_Vol_Abs': '匹配量', 'Cargo_ID': '实货编号'},
-                     barmode='group')
-        fig.update_layout(xaxis_tickangle=-45)
-        return fig
-    
-    def create_position_summary_table(self):
-        """创建头寸汇总表"""
-        tabs = st.tabs(["开仓汇总", "平仓汇总"])
-        
-        with tabs[0]:
-            if self.open_summary is not None and not self.open_summary.empty:
-                st.dataframe(self.open_summary, use_container_width=True)
-                st.caption(f"开仓头寸汇总 ({len(self.open_summary)}个商品-月份组合)")
-                
-                # 显示开仓加权平均价格
-                st.subheader("开仓加权平均价格汇总")
-                for _, row in self.open_summary.iterrows():
-                    st.write(f"**{row['Commodity']} - {row['Month']}**: "
-                            f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
-            else:
-                st.info("无开仓头寸数据")
-        
-        with tabs[1]:
-            if self.close_summary is not None and not self.close_summary.empty:
-                st.dataframe(self.close_summary, use_container_width=True)
-                st.caption(f"平仓头寸汇总 ({len(self.close_summary)}个商品-月份组合)")
-                
-                # 显示平仓加权平均价格
-                st.subheader("平仓加权平均价格汇总")
-                for _, row in self.close_summary.iterrows():
-                    st.write(f"**{row['Commodity']} - {row['Month']}**: "
-                            f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
-            else:
-                st.info("无平仓头寸数据")
 
 # ---------------------------------------------------------
 # 3. Streamlit 主应用
@@ -671,6 +732,13 @@ def main():
         padding: 1rem;
         border-radius: 0.5rem;
         border-left: 4px solid #F59E0B;
+        margin: 1rem 0;
+    }
+    .error-box {
+        background-color: #FEE2E2;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #EF4444;
         margin: 1rem 0;
     }
     </style>
@@ -763,17 +831,18 @@ def main():
                     st.caption(f"关键字段: {', '.join(df_physical_raw.columns.tolist()[:5])}...")
             
             # 显示匹配规则说明
-            st.markdown('<div class="info-box">'
-                       '<h4>🎯 匹配规则说明</h4>'
-                       '<ul>'
-                       '<li><b>优先级1:</b> 优先匹配BRENT计价品种，JCC次之</li>'
-                       '<li><b>优先级2:</b> 按phy-2026-04 → 05 → 01 → 02 → 03顺序匹配</li>'
-                       '<li><b>时间限制:</b> 仅匹配指定日期（{designation_date}）之后的纸货交易</li>'
-                       '<li><b>数量:</b> 正数为开仓，负数为平仓</li>'
-                       '<li><b>加权均价:</b> 自动计算开仓/平仓加权平均价格</li>'
-                       '</ul>'
-                       '</div>'.format(designation_date=designation_date), 
-                       unsafe_allow_html=True)
+            st.markdown(f'''
+            <div class="info-box">
+            <h4>🎯 匹配规则说明</h4>
+            <ul>
+            <li><b>优先级1:</b> 优先匹配BRENT计价品种，JCC次之</li>
+            <li><b>优先级2:</b> 按phy-2026-04 → 05 → 01 → 02 → 03顺序匹配</li>
+            <li><b>时间限制:</b> 仅匹配指定日期（{designation_date}）之后的纸货交易</li>
+            <li><b>数量:</b> 正数为开仓，负数为平仓</li>
+            <li><b>加权均价:</b> 自动计算开仓/平仓加权平均价格</li>
+            </ul>
+            </div>
+            ''', unsafe_allow_html=True)
             
             # 执行匹配按钮
             if st.button("🚀 执行套保匹配", type="primary", use_container_width=True):
@@ -786,7 +855,7 @@ def main():
                             df_paper_raw, df_physical_raw, str(designation_date)
                         )
                         
-                        if df_relations is not None:
+                        if df_relations is not None and not df_relations.empty:
                             # 创建分析模块
                             st.session_state.analysis = HedgeAnalysis(
                                 df_relations, df_physical_updated, df_paper_net,
@@ -795,11 +864,14 @@ def main():
                             st.session_state.matching_complete = True
                             
                             # 显示匹配成功信息
-                            st.markdown('<div class="success-box">'
-                                       '<h4>✅ 套保匹配成功完成！</h4>'
-                                       f'<p>匹配日期范围: {designation_date} 之后</p>'
-                                       f'<p>匹配优先级: BRENT优先，实货按指定顺序匹配</p>'
-                                       '</div>', unsafe_allow_html=True)
+                            st.markdown(f'''
+                            <div class="success-box">
+                            <h4>✅ 套保匹配成功完成！</h4>
+                            <p>匹配日期范围: {designation_date} 之后</p>
+                            <p>匹配优先级: BRENT优先，实货按指定顺序匹配</p>
+                            <p>匹配记录数: {len(df_relations)}条</p>
+                            </div>
+                            ''', unsafe_allow_html=True)
                             
                             # 显示匹配过程数据
                             with st.expander("📊 匹配过程数据", expanded=False):
@@ -833,15 +905,39 @@ def main():
                                         st.dataframe(close_df.head(10), use_container_width=True)
                                         st.caption(f"平仓记录: {len(close_df)}条")
                         else:
-                            st.error("匹配过程出现错误，请检查数据格式。")
+                            st.markdown('<div class="warning-box">⚠️ 匹配过程完成，但未生成匹配记录</div>', unsafe_allow_html=True)
+                            st.info("可能的原因：")
+                            st.write("1. 指定日期之后没有可用的纸货交易")
+                            st.write("2. 实货数据中没有需要匹配的头寸")
+                            st.write("3. 商品或月份不匹配")
+                            
+                            # 创建空的分析模块
+                            st.session_state.analysis = HedgeAnalysis(
+                                pd.DataFrame(), df_physical_raw, pd.DataFrame(),
+                                pd.DataFrame(), pd.DataFrame()
+                            )
+                            st.session_state.matching_complete = True
                             
                     except Exception as e:
-                        st.error(f"匹配过程中出现错误: {str(e)}")
-                        st.exception(e)
+                        st.markdown(f'<div class="error-box">❌ 匹配过程中出现错误: {str(e)}</div>', unsafe_allow_html=True)
+                        
+                        # 显示详细错误信息
+                        with st.expander("查看错误详情"):
+                            st.exception(e)
+                        
+                        st.info("建议检查：")
+                        st.write("1. 数据格式是否正确（特别是日期和数值列）")
+                        st.write("2. 必要字段是否存在（Cargo_ID, Trade Date, Volume等）")
+                        st.write("3. 数据中是否有异常值或空值")
         
         except Exception as e:
             st.error(f"数据读取错误: {str(e)}")
             st.info("请确保上传的文件格式正确，并包含必要的字段。")
+            
+            # 显示文件信息
+            with st.expander("文件信息"):
+                st.write(f"纸货文件: {paper_file.name}")
+                st.write(f"实货文件: {physical_file.name}")
     
     # 显示分析结果
     if st.session_state.matching_complete and st.session_state.analysis is not None:
@@ -856,88 +952,75 @@ def main():
         # 2. 头寸汇总表（开仓/平仓加权均价）
         if show_positions:
             st.markdown('<h3 class="sub-header">⚖️ 头寸汇总与加权平均价格</h3>', unsafe_allow_html=True)
-            analysis.create_position_summary_table()
+            
+            if not analysis.open_summary.empty or not analysis.close_summary.empty:
+                tabs = st.tabs(["开仓汇总", "平仓汇总"])
+                
+                with tabs[0]:
+                    if not analysis.open_summary.empty:
+                        st.dataframe(analysis.open_summary, use_container_width=True)
+                        st.caption(f"开仓头寸汇总 ({len(analysis.open_summary)}个商品-月份组合)")
+                        
+                        # 显示开仓加权平均价格
+                        st.subheader("开仓加权平均价格汇总")
+                        for _, row in analysis.open_summary.iterrows():
+                            st.write(f"**{row['Commodity']} - {row['Month']}**: "
+                                    f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
+                    else:
+                        st.info("无开仓头寸数据")
+                
+                with tabs[1]:
+                    if not analysis.close_summary.empty:
+                        st.dataframe(analysis.close_summary, use_container_width=True)
+                        st.caption(f"平仓头寸汇总 ({len(analysis.close_summary)}个商品-月份组合)")
+                        
+                        # 显示平仓加权平均价格
+                        st.subheader("平仓加权平均价格汇总")
+                        for _, row in analysis.close_summary.iterrows():
+                            st.write(f"**{row['Commodity']} - {row['Month']}**: "
+                                    f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
+                    else:
+                        st.info("无平仓头寸数据")
+            else:
+                st.info("暂无头寸汇总数据")
         
         # 3. 匹配明细表
-        st.markdown('<h3 class="sub-header">📋 匹配明细表</h3>', unsafe_allow_html=True)
-        
-        # 添加筛选器
-        col1, col2 = st.columns(2)
-        with col1:
-            position_filter = st.selectbox(
-                "头寸类型筛选",
-                ["全部", "开仓", "平仓"],
-                index=0
-            )
-        
-        with col2:
-            commodity_filter = st.multiselect(
-                "商品筛选",
-                options=analysis.df_relations['Commodity'].unique() if 'Commodity' in analysis.df_relations.columns else [],
-                default=analysis.df_relations['Commodity'].unique() if 'Commodity' in analysis.df_relations.columns else []
-            )
-        
-        # 应用筛选
-        filtered_df = analysis.df_relations.copy()
-        if position_filter != "全部":
-            filtered_df = filtered_df[filtered_df['Position_Type'] == position_filter]
-        
-        if commodity_filter:
-            filtered_df = filtered_df[filtered_df['Commodity'].isin(commodity_filter)]
-        
-        # 显示筛选后的数据
-        st.dataframe(filtered_df.head(max_rows), use_container_width=True)
-        st.caption(f"显示 {len(filtered_df.head(max_rows))} 条记录，共 {len(filtered_df)} 条匹配记录 (筛选后)")
-        
-        # 4. 分析图表
-        if show_charts and not analysis.df_relations.empty:
-            st.markdown('<h3 class="sub-header">📈 可视化分析</h3>', unsafe_allow_html=True)
+        if not analysis.df_relations.empty:
+            st.markdown('<h3 class="sub-header">📋 匹配明细表</h3>', unsafe_allow_html=True)
             
-            # 图表选项卡
-            tab1, tab2 = st.tabs([
-                "📊 匹配量分析", "💰 P/L分析"
-            ])
+            # 添加筛选器
+            col1, col2 = st.columns(2)
+            with col1:
+                position_filter = st.selectbox(
+                    "头寸类型筛选",
+                    ["全部", "开仓", "平仓"],
+                    index=0
+                )
             
-            with tab1:
-                fig1 = analysis.create_match_volume_chart()
-                if fig1:
-                    st.plotly_chart(fig1, use_container_width=True)
-                else:
-                    st.info("无匹配量数据")
-            
-            with tab2:
-                # P/L分析
-                if not analysis.df_relations.empty and 'Alloc_Total_PL' in analysis.df_relations.columns:
-                    fig = make_subplots(
-                        rows=1, cols=2,
-                        subplot_titles=('💰 P/L分布', '📊 P/L按头寸类型'),
-                        specs=[[{"type": "histogram"}, {"type": "pie"}]]
+            with col2:
+                if 'Commodity' in analysis.df_relations.columns:
+                    commodity_options = analysis.df_relations['Commodity'].unique()
+                    commodity_filter = st.multiselect(
+                        "商品筛选",
+                        options=commodity_options,
+                        default=commodity_options
                     )
-                    
-                    # P/L直方图
-                    fig.add_trace(
-                        go.Histogram(x=analysis.df_relations['Alloc_Total_PL'], nbinsx=30,
-                                    name='P/L分布'),
-                        row=1, col=1
-                    )
-                    fig.add_vline(x=0, line_dash="dash", line_color="red", row=1, col=1)
-                    
-                    # P/L按头寸类型
-                    if 'Position_Type' in analysis.df_relations.columns:
-                        pl_by_type = analysis.df_relations.groupby('Position_Type')['Alloc_Total_PL'].sum().reset_index()
-                        fig.add_trace(
-                            go.Pie(labels=pl_by_type['Position_Type'], 
-                                  values=pl_by_type['Alloc_Total_PL'],
-                                  name='P/L按类型'),
-                            row=1, col=2
-                        )
-                    
-                    fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info("无P/L数据")
+                    commodity_filter = []
+            
+            # 应用筛选
+            filtered_df = analysis.df_relations.copy()
+            if position_filter != "全部":
+                filtered_df = filtered_df[filtered_df['Position_Type'] == position_filter]
+            
+            if commodity_filter:
+                filtered_df = filtered_df[filtered_df['Commodity'].isin(commodity_filter)]
+            
+            # 显示筛选后的数据
+            st.dataframe(filtered_df.head(max_rows), use_container_width=True)
+            st.caption(f"显示 {len(filtered_df.head(max_rows))} 条记录，共 {len(filtered_df)} 条匹配记录 (筛选后)")
         
-        # 5. 数据导出
+        # 4. 数据导出
         st.markdown("---")
         st.markdown('<h3 class="sub-header">💾 数据导出</h3>', unsafe_allow_html=True)
         
@@ -957,7 +1040,7 @@ def main():
         
         with col2:
             # 导出开仓汇总
-            if analysis.open_summary is not None and not analysis.open_summary.empty:
+            if not analysis.open_summary.empty:
                 open_csv = analysis.open_summary.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="⚖️ 开仓汇总",
@@ -969,7 +1052,7 @@ def main():
         
         with col3:
             # 导出平仓汇总
-            if analysis.close_summary is not None and not analysis.close_summary.empty:
+            if not analysis.close_summary.empty:
                 close_csv = analysis.close_summary.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="⚖️ 平仓汇总",
@@ -990,11 +1073,11 @@ def main():
                             df.to_excel(writer, sheet_name=sheet_name, index=False)
                 return output.getvalue()
             
-            if analysis.df_relations is not None:
+            if not analysis.df_relations.empty:
                 excel_data = convert_to_excel({
                     "匹配结果": analysis.df_relations,
-                    "开仓汇总": analysis.open_summary if analysis.open_summary is not None else pd.DataFrame(),
-                    "平仓汇总": analysis.close_summary if analysis.close_summary is not None else pd.DataFrame(),
+                    "开仓汇总": analysis.open_summary,
+                    "平仓汇总": analysis.close_summary,
                     "实货数据": analysis.df_physical,
                     "纸货净仓": analysis.df_paper_net
                 })
@@ -1063,36 +1146,6 @@ def main():
                 - 特定Cargo_ID优先顺序
                 - 自动计算加权均价
                 """)
-            
-            st.markdown("---")
-            
-            # 示例数据展示
-            with st.expander("📚 查看数据格式示例"):
-                example_tab1, example_tab2 = st.tabs(["纸货示例", "实货示例"])
-                
-                with example_tab1:
-                    example_paper = pd.DataFrame({
-                        'Trade Date': ['2024-11-12', '2024-11-13', '2024-11-14', '2024-11-10'],
-                        'Volume': [1000, -500, 2000, 1500],
-                        'Commodity': ['BRENT', 'BRENT', 'JCC', 'BRENT'],
-                        'Month': ['JAN 25', 'JAN 25', 'FEB 25', 'DEC 24'],
-                        'Price': [75.50, 76.20, 74.80, 74.00],
-                        'Recap No': ['TKT-001', 'TKT-002', 'TKT-003', 'TKT-004']
-                    })
-                    st.dataframe(example_paper, use_container_width=True)
-                    st.caption("注意: 2024-11-10的交易在指定日期之前，不会被匹配")
-                
-                with example_tab2:
-                    example_physical = pd.DataFrame({
-                        'Cargo_ID': ['PHY-2026-04-001', 'PHY-2026-05-001', 'PHY-2026-01-001'],
-                        'Volume': [500000, 300000, 400000],
-                        'Hedge_Proxy': ['BRENT', 'JCC', 'BRENT'],
-                        'Target_Contract_Month': ['JAN 25', 'FEB 25', 'JAN 25'],
-                        'Direction': ['Buy', 'Buy', 'Sell'],
-                        'Designation_Date': ['2024-11-12', '2024-11-12', '2024-11-12']
-                    })
-                    st.dataframe(example_physical, use_container_width=True)
-                    st.caption("注意: PHY-2026-04优先于PHY-2026-05，PHY-2026-05优先于PHY-2026-01")
 
 if __name__ == "__main__":
     main()
