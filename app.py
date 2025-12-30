@@ -244,17 +244,13 @@ class HedgeMatchingEngine:
         """准备数据框用于操作，确保没有不可哈希的类型"""
         df_copy = df.copy()
         
-        # 将Close_Events列表转换为字符串表示，以便去重操作
-        if 'Close_Events' in df_copy.columns:
-            df_copy['Close_Events_Str'] = df_copy['Close_Events'].apply(
-                lambda x: json.dumps(x) if isinstance(x, list) else str(x)
-            )
-            # 创建一个不带Close_Events列的数据框用于去重
-            df_for_ops = df_copy.drop(columns=['Close_Events'])
-        else:
-            df_for_ops = df_copy
+        for col in df_copy.columns:
+            if df_copy[col].apply(lambda x: isinstance(x, list)).any():
+                df_copy[col] = df_copy[col].apply(
+                    lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, list) else x
+                )
         
-        return df_for_ops
+        return df_copy
     
     def match_hedges(self, df_physical, df_paper_net, designation_date):
         """实货匹配 - 根据新需求更新"""
@@ -266,7 +262,7 @@ class HedgeMatchingEngine:
         close_positions = []  # 记录平仓头寸
         
         # 准备纸货数据用于操作
-        active_paper = df_paper_net.copy()
+        active_paper = self.prepare_dataframe_for_operations(df_paper_net)
         active_paper['Allocated_To_Phy'] = 0.0
         active_paper['_original_index'] = active_paper.index
         
