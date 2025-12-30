@@ -32,12 +32,21 @@ class HedgeMatchingEngine:
         
     def clean_str(self, series):
         """清洗字符串 - 处理NaN和float值"""
+        if series.empty:
+            return pd.Series([], dtype=str)
+            
         # 先转换为字符串，处理NaN
         series = series.copy()
         series = series.fillna('')
         
-        # 转换为字符串并处理
-        return series.astype(str).str.strip().str.upper().replace('NAN', '').replace('NONE', '')
+        # 安全转换为字符串
+        def safe_str(x):
+            if isinstance(x, (int, float)):
+                return str(x)
+            return str(x)
+        
+        series = series.apply(safe_str)
+        return series.str.strip().str.upper().replace('NAN', '').replace('NONE', '')
     
     def standardize_month(self, series):
         """标准化月份格式 - 增强错误处理"""
@@ -46,7 +55,15 @@ class HedgeMatchingEngine:
             
         s = series.copy()
         s = s.fillna('')
-        s = s.astype(str).str.strip().str.upper()
+        
+        # 安全转换为字符串
+        def safe_str(x):
+            if isinstance(x, (int, float)):
+                return str(x)
+            return str(x)
+        
+        s = s.apply(safe_str)
+        s = s.str.strip().str.upper()
         s = s.str.replace('-', ' ', regex=False).str.replace('/', ' ', regex=False)
         dates = pd.to_datetime(s, errors='coerce', format='mixed')
         result = dates.dt.strftime('%b %y').str.upper()
@@ -62,7 +79,7 @@ class HedgeMatchingEngine:
                     yr, mon = m.groups()
                     return f"{mon} {yr}"
                 return val
-            swapped = invalid.map(swap_if_match)
+            swapped = invalid.apply(swap_if_match)
             swapped_dates = pd.to_datetime(swapped, errors='coerce')
             swapped_formatted = swapped_dates.dt.strftime('%b %y').str.upper()
             result.loc[mask_invalid & swapped_dates.notna()] = swapped_formatted.loc[swapped_dates.notna()]
@@ -74,15 +91,15 @@ class HedgeMatchingEngine:
     
     def safe_upper(self, value):
         """安全的字符串大写转换"""
-        if pd.isna(value):
+        if pd.isna(value) or value is None:
             return ''
         if isinstance(value, (int, float)):
-            return str(value)
+            return str(value).upper()
         return str(value).upper()
     
     def get_physical_priority(self, cargo_id):
         """获取实货匹配优先级 - 增强错误处理"""
-        if pd.isna(cargo_id):
+        if pd.isna(cargo_id) or cargo_id is None:
             return 100
             
         # 安全转换为字符串
@@ -107,7 +124,7 @@ class HedgeMatchingEngine:
     
     def get_commodity_priority(self, commodity):
         """获取商品优先级：BRENT优先，JCC次之"""
-        if pd.isna(commodity):
+        if pd.isna(commodity) or commodity is None:
             return 3
             
         commodity_str = self.safe_upper(str(commodity))
@@ -243,11 +260,11 @@ class HedgeMatchingEngine:
                 return pd.DataFrame(), df_physical
         
         # 确保数据格式正确
-        df_phy['Cargo_ID'] = df_phy['Cargo_ID'].fillna('').astype(str)
+        df_phy['Cargo_ID'] = df_phy['Cargo_ID'].apply(lambda x: '' if pd.isna(x) else str(x))
         df_phy['Unhedged_Volume'] = pd.to_numeric(df_phy['Unhedged_Volume'], errors='coerce').fillna(0)
         
         if 'Hedge_Proxy' in df_phy.columns:
-            df_phy['Hedge_Proxy'] = df_phy['Hedge_Proxy'].fillna('').astype(str)
+            df_phy['Hedge_Proxy'] = df_phy['Hedge_Proxy'].apply(lambda x: '' if pd.isna(x) else str(x))
         
         # 按优先级排序实货
         # 1. 商品优先级：BRENT优先
@@ -298,7 +315,7 @@ class HedgeMatchingEngine:
             
             if not candidates_df.empty and target_month:
                 month_mask = candidates_df['Month'].apply(
-                    lambda x: str(target_month).upper() == self.safe_upper(x)
+                    lambda x: str(target_month).upper() == self.safe_upper(str(x))
                 )
                 candidates_df = candidates_df[month_mask].copy()
             
@@ -479,99 +496,107 @@ class HedgeMatchingEngine:
     
     def run_matching(self, df_paper_raw, df_physical_raw, designation_date="2024-11-12"):
         """执行完整匹配流程"""
-        # 数据预处理
-        st.info("🔄 数据预处理中...")
-        
-        # 纸货预处理
-        df_paper = df_paper_raw.copy()
-        
-        # 确保必要的列存在
-        required_cols_paper = ['Trade Date', 'Volume', 'Commodity']
-        for col in required_cols_paper:
-            if col not in df_paper.columns:
-                st.error(f"纸货数据缺少必要列: {col}")
-                return None, None, None, None, None, None
-        
-        # 标准化处理
-        df_paper['Trade Date'] = pd.to_datetime(df_paper['Trade Date'], errors='coerce')
-        df_paper['Volume'] = pd.to_numeric(df_paper['Volume'], errors='coerce').fillna(0)
-        df_paper['Std_Commodity'] = self.clean_str(df_paper['Commodity'])
-        
-        if 'Month' in df_paper.columns:
-            df_paper['Month'] = self.standardize_month(df_paper['Month'])
-        else:
-            # 如果没有Month列，尝试从其他列推断或创建默认值
-            df_paper['Month'] = df_paper['Trade Date'].dt.strftime('%b %y').str.upper()
-        
-        # 处理缺失字段
-        if 'Recap No' not in df_paper.columns:
-            df_paper['Recap No'] = [f"TKT-{i+1:04d}" for i in range(len(df_paper))]
-        
-        for col in ['Price', 'Mtm Price', 'Total P/L']:
-            if col not in df_paper.columns:
-                df_paper[col] = 0.0
-        
-        # 实货预处理
-        df_physical = df_physical_raw.copy()
-        
-        # 标准化列名
-        col_mapping = {
-            'Target_Pricing_Month': 'Target_Contract_Month',
-            'Month': 'Target_Contract_Month',
-            'Hedge_Proxy': 'Hedge_Proxy',
-            'Direction': 'Direction'
-        }
-        
-        for old_col, new_col in col_mapping.items():
-            if old_col in df_physical.columns and new_col not in df_physical.columns:
-                df_physical[new_col] = df_physical[old_col]
-        
-        # 确保必要列
-        if 'Volume' in df_physical.columns:
-            df_physical['Volume'] = pd.to_numeric(df_physical['Volume'], errors='coerce').fillna(0)
-            df_physical['Unhedged_Volume'] = df_physical['Volume']
-        
-        if 'Hedge_Proxy' in df_physical.columns:
-            df_physical['Hedge_Proxy'] = self.clean_str(df_physical['Hedge_Proxy'])
-        
-        if 'Target_Contract_Month' in df_physical.columns:
-            df_physical['Target_Contract_Month'] = self.standardize_month(df_physical['Target_Contract_Month'])
-        
-        # 指定日期
-        date_cols = ['Designation_Date', 'Pricing_Start', 'Trade Date']
-        for col in date_cols:
-            if col in df_physical.columns:
-                df_physical['Designation_Date'] = pd.to_datetime(df_physical[col], errors='coerce')
-                break
-        else:
-            df_physical['Designation_Date'] = pd.NaT
-        
-        # 数据验证
-        st.info("🔄 数据验证中...")
-        
-        # 检查实货Cargo_ID
-        if 'Cargo_ID' in df_physical.columns:
-            df_physical['Cargo_ID'] = df_physical['Cargo_ID'].fillna('').astype(str)
-            st.info(f"实货Cargo_ID数量: {len(df_physical['Cargo_ID'].unique())}")
-        
-        # 检查纸货数据
-        st.info(f"纸货交易总数: {len(df_paper)}")
-        st.info(f"指定匹配开始日期: {designation_date}")
-        
-        # 执行匹配
-        self.df_paper_net = self.calculate_net_positions(df_paper, designation_date)
-        
-        if self.df_paper_net.empty:
-            st.warning("纸货净仓数据为空，请检查数据或调整指定日期")
-            return pd.DataFrame(), df_physical, pd.DataFrame(), df_paper, pd.DataFrame(), pd.DataFrame()
-        
-        self.df_relations, self.df_physical_updated = self.match_hedges(
-            df_physical, self.df_paper_net, designation_date
-        )
-        
-        return (self.df_relations, self.df_physical_updated, 
-                self.df_paper_net, df_paper, 
-                self.open_positions_summary, self.close_positions_summary)
+        try:
+            # 数据预处理
+            st.info("🔄 数据预处理中...")
+            
+            # 纸货预处理
+            df_paper = df_paper_raw.copy()
+            
+            # 确保必要的列存在
+            required_cols_paper = ['Trade Date', 'Volume', 'Commodity']
+            for col in required_cols_paper:
+                if col not in df_paper.columns:
+                    st.error(f"纸货数据缺少必要列: {col}")
+                    return pd.DataFrame(), df_physical_raw, pd.DataFrame(), df_paper, pd.DataFrame(), pd.DataFrame()
+            
+            # 标准化处理
+            df_paper['Trade Date'] = pd.to_datetime(df_paper['Trade Date'], errors='coerce')
+            df_paper['Volume'] = pd.to_numeric(df_paper['Volume'], errors='coerce').fillna(0)
+            df_paper['Std_Commodity'] = self.clean_str(df_paper['Commodity'])
+            
+            if 'Month' in df_paper.columns:
+                df_paper['Month'] = self.standardize_month(df_paper['Month'])
+            else:
+                # 如果没有Month列，尝试从其他列推断或创建默认值
+                df_paper['Month'] = df_paper['Trade Date'].dt.strftime('%b %y').str.upper()
+            
+            # 处理缺失字段
+            if 'Recap No' not in df_paper.columns:
+                df_paper['Recap No'] = [f"TKT-{i+1:04d}" for i in range(len(df_paper))]
+            
+            for col in ['Price', 'Mtm Price', 'Total P/L']:
+                if col not in df_paper.columns:
+                    df_paper[col] = 0.0
+            
+            # 实货预处理
+            df_physical = df_physical_raw.copy()
+            
+            # 标准化列名
+            col_mapping = {
+                'Target_Pricing_Month': 'Target_Contract_Month',
+                'Month': 'Target_Contract_Month',
+                'Hedge_Proxy': 'Hedge_Proxy',
+                'Direction': 'Direction'
+            }
+            
+            for old_col, new_col in col_mapping.items():
+                if old_col in df_physical.columns and new_col not in df_physical.columns:
+                    df_physical[new_col] = df_physical[old_col]
+            
+            # 确保必要列
+            if 'Volume' in df_physical.columns:
+                df_physical['Volume'] = pd.to_numeric(df_physical['Volume'], errors='coerce').fillna(0)
+                df_physical['Unhedged_Volume'] = df_physical['Volume']
+            
+            if 'Hedge_Proxy' in df_physical.columns:
+                df_physical['Hedge_Proxy'] = self.clean_str(df_physical['Hedge_Proxy'])
+            
+            if 'Target_Contract_Month' in df_physical.columns:
+                df_physical['Target_Contract_Month'] = self.standardize_month(df_physical['Target_Contract_Month'])
+            
+            # 指定日期
+            date_cols = ['Designation_Date', 'Pricing_Start', 'Trade Date']
+            for col in date_cols:
+                if col in df_physical.columns:
+                    df_physical['Designation_Date'] = pd.to_datetime(df_physical[col], errors='coerce')
+                    break
+            else:
+                df_physical['Designation_Date'] = pd.NaT
+            
+            # 数据验证
+            st.info("🔄 数据验证中...")
+            
+            # 检查实货Cargo_ID
+            if 'Cargo_ID' in df_physical.columns:
+                df_physical['Cargo_ID'] = df_physical['Cargo_ID'].apply(lambda x: '' if pd.isna(x) else str(x))
+                unique_cargos = len(df_physical['Cargo_ID'].unique())
+                st.info(f"实货Cargo_ID数量: {unique_cargos}")
+            
+            # 检查纸货数据
+            paper_count = len(df_paper)
+            st.info(f"纸货交易总数: {paper_count}")
+            st.info(f"指定匹配开始日期: {designation_date}")
+            
+            # 执行匹配
+            self.df_paper_net = self.calculate_net_positions(df_paper, designation_date)
+            
+            if self.df_paper_net.empty:
+                st.warning("纸货净仓数据为空，请检查数据或调整指定日期")
+                return pd.DataFrame(), df_physical, pd.DataFrame(), df_paper, pd.DataFrame(), pd.DataFrame()
+            
+            self.df_relations, self.df_physical_updated = self.match_hedges(
+                df_physical, self.df_paper_net, designation_date
+            )
+            
+            return (self.df_relations, self.df_physical_updated, 
+                    self.df_paper_net, df_paper, 
+                    self.open_positions_summary, self.close_positions_summary)
+            
+        except Exception as e:
+            st.error(f"匹配过程出现异常: {str(e)}")
+            st.exception(e)
+            return pd.DataFrame(), df_physical_raw, pd.DataFrame(), df_paper_raw, pd.DataFrame(), pd.DataFrame()
 
 # ---------------------------------------------------------
 # 2. 分析模块 (基于真实匹配结果)
@@ -611,55 +636,77 @@ class HedgeAnalysis:
             }
             return
         
-        # 匹配统计
-        total_matched = abs(self.df_relations['Allocated_Vol']).sum()
-        
-        if 'Volume' in self.df_physical.columns:
-            total_physical = abs(self.df_physical['Volume']).sum()
-        else:
-            total_physical = 0
+        try:
+            # 匹配统计
+            if 'Allocated_Vol' in self.df_relations.columns:
+                total_matched = abs(self.df_relations['Allocated_Vol']).sum()
+            else:
+                total_matched = 0
             
-        match_rate = (total_matched / total_physical * 100) if total_physical > 0 else 0
-        
-        # 开仓平仓统计
-        open_positions = self.df_relations[self.df_relations['Allocated_Vol'] > 0]
-        close_positions = self.df_relations[self.df_relations['Allocated_Vol'] < 0]
-        
-        open_volume = open_positions['Allocated_Vol'].sum() if not open_positions.empty else 0
-        close_volume = abs(close_positions['Allocated_Vol'].sum()) if not close_positions.empty else 0
-        
-        # 财务统计
-        total_pl = self.df_relations['Alloc_Total_PL'].sum() if 'Alloc_Total_PL' in self.df_relations.columns else 0
-        total_unrealized = self.df_relations['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in self.df_relations.columns else 0
-        
-        # 数量统计
-        matched_cargos = self.df_relations['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_relations.columns else 0
-        total_cargos = self.df_physical['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_physical.columns else 0
-        total_tickets = len(self.df_relations)
-        
-        # 时间统计
-        if 'Time_Lag' in self.df_relations.columns:
-            avg_time_lag = self.df_relations['Time_Lag'].abs().mean()
-            std_time_lag = self.df_relations['Time_Lag'].abs().std()
-        else:
-            avg_time_lag = std_time_lag = 0
-        
-        self.summary_stats = {
-            'total_matched': total_matched,
-            'total_physical': total_physical,
-            'match_rate': match_rate,
-            'open_volume': open_volume,
-            'close_volume': close_volume,
-            'total_pl': total_pl,
-            'total_unrealized': total_unrealized,
-            'matched_cargos': matched_cargos,
-            'total_cargos': total_cargos,
-            'total_tickets': total_tickets,
-            'open_count': len(open_positions),
-            'close_count': len(close_positions),
-            'avg_time_lag': avg_time_lag,
-            'std_time_lag': std_time_lag
-        }
+            if 'Volume' in self.df_physical.columns:
+                total_physical = abs(self.df_physical['Volume']).sum()
+            else:
+                total_physical = 0
+                
+            match_rate = (total_matched / total_physical * 100) if total_physical > 0 else 0
+            
+            # 开仓平仓统计
+            if 'Allocated_Vol' in self.df_relations.columns:
+                open_positions = self.df_relations[self.df_relations['Allocated_Vol'] > 0]
+                close_positions = self.df_relations[self.df_relations['Allocated_Vol'] < 0]
+                
+                open_volume = open_positions['Allocated_Vol'].sum() if not open_positions.empty else 0
+                close_volume = abs(close_positions['Allocated_Vol'].sum()) if not close_positions.empty else 0
+            else:
+                open_volume = close_volume = 0
+            
+            # 财务统计
+            total_pl = self.df_relations['Alloc_Total_PL'].sum() if 'Alloc_Total_PL' in self.df_relations.columns else 0
+            total_unrealized = self.df_relations['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in self.df_relations.columns else 0
+            
+            # 数量统计
+            matched_cargos = self.df_relations['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_relations.columns else 0
+            total_cargos = self.df_physical['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_physical.columns else 0
+            total_tickets = len(self.df_relations)
+            
+            # 时间统计
+            if 'Time_Lag' in self.df_relations.columns:
+                avg_time_lag = self.df_relations['Time_Lag'].abs().mean()
+                std_time_lag = self.df_relations['Time_Lag'].abs().std()
+            else:
+                avg_time_lag = std_time_lag = 0
+            
+            self.summary_stats = {
+                'total_matched': total_matched,
+                'total_physical': total_physical,
+                'match_rate': match_rate,
+                'open_volume': open_volume,
+                'close_volume': close_volume,
+                'total_pl': total_pl,
+                'total_unrealized': total_unrealized,
+                'matched_cargos': matched_cargos,
+                'total_cargos': total_cargos,
+                'total_tickets': total_tickets,
+                'avg_time_lag': avg_time_lag,
+                'std_time_lag': std_time_lag
+            }
+            
+        except Exception as e:
+            st.warning(f"计算汇总统计时出现错误: {str(e)}")
+            self.summary_stats = {
+                'total_matched': 0,
+                'total_physical': 0,
+                'match_rate': 0,
+                'open_volume': 0,
+                'close_volume': 0,
+                'total_pl': 0,
+                'total_unrealized': 0,
+                'matched_cargos': 0,
+                'total_cargos': 0,
+                'total_tickets': 0,
+                'avg_time_lag': 0,
+                'std_time_lag': 0
+            }
     
     def create_summary_metrics(self):
         """创建概览指标卡片"""
@@ -682,7 +729,7 @@ class HedgeAnalysis:
         
         with col4:
             st.metric("⚖️ 开仓/平仓", f"{stats['open_volume']:,.0f}/{stats['close_volume']:,.0f}",
-                     delta=f"{stats['open_count']}/{stats['close_count']}笔")
+                     delta=f"{stats['matched_cargos']}个实货")
 
 # ---------------------------------------------------------
 # 3. Streamlit 主应用
@@ -873,37 +920,6 @@ def main():
                             </div>
                             ''', unsafe_allow_html=True)
                             
-                            # 显示匹配过程数据
-                            with st.expander("📊 匹配过程数据", expanded=False):
-                                tab1, tab2, tab3, tab4 = st.tabs(["纸货净仓", "实货更新", "匹配关系", "头寸明细"])
-                                
-                                with tab1:
-                                    st.dataframe(df_paper_net.head(20), use_container_width=True)
-                                    st.caption(f"纸货净仓数据 ({len(df_paper_net)}行)")
-                                
-                                with tab2:
-                                    st.dataframe(df_physical_updated.head(20), use_container_width=True)
-                                    st.caption(f"更新后实货数据 ({len(df_physical_updated)}行)")
-                                
-                                with tab3:
-                                    st.dataframe(df_relations.head(20), use_container_width=True)
-                                    st.caption(f"匹配关系数据 ({len(df_relations)}行)")
-                                
-                                with tab4:
-                                    # 开仓和平仓明细
-                                    open_df = df_relations[df_relations['Allocated_Vol'] > 0]
-                                    close_df = df_relations[df_relations['Allocated_Vol'] < 0]
-                                    
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.markdown("**开仓明细**")
-                                        st.dataframe(open_df.head(10), use_container_width=True)
-                                        st.caption(f"开仓记录: {len(open_df)}条")
-                                    
-                                    with col2:
-                                        st.markdown("**平仓明细**")
-                                        st.dataframe(close_df.head(10), use_container_width=True)
-                                        st.caption(f"平仓记录: {len(close_df)}条")
                         else:
                             st.markdown('<div class="warning-box">⚠️ 匹配过程完成，但未生成匹配记录</div>', unsafe_allow_html=True)
                             st.info("可能的原因：")
@@ -924,68 +940,23 @@ def main():
                         # 显示详细错误信息
                         with st.expander("查看错误详情"):
                             st.exception(e)
-                        
-                        st.info("建议检查：")
-                        st.write("1. 数据格式是否正确（特别是日期和数值列）")
-                        st.write("2. 必要字段是否存在（Cargo_ID, Trade Date, Volume等）")
-                        st.write("3. 数据中是否有异常值或空值")
         
         except Exception as e:
             st.error(f"数据读取错误: {str(e)}")
             st.info("请确保上传的文件格式正确，并包含必要的字段。")
-            
-            # 显示文件信息
-            with st.expander("文件信息"):
-                st.write(f"纸货文件: {paper_file.name}")
-                st.write(f"实货文件: {physical_file.name}")
     
     # 显示分析结果
     if st.session_state.matching_complete and st.session_state.analysis is not None:
-        st.markdown("---")
-        st.markdown('<h2 class="sub-header">📊 匹配分析结果</h2>', unsafe_allow_html=True)
-        
         analysis = st.session_state.analysis
         
-        # 1. 概览指标
-        analysis.create_summary_metrics()
-        
-        # 2. 头寸汇总表（开仓/平仓加权均价）
-        if show_positions:
-            st.markdown('<h3 class="sub-header">⚖️ 头寸汇总与加权平均价格</h3>', unsafe_allow_html=True)
-            
-            if not analysis.open_summary.empty or not analysis.close_summary.empty:
-                tabs = st.tabs(["开仓汇总", "平仓汇总"])
-                
-                with tabs[0]:
-                    if not analysis.open_summary.empty:
-                        st.dataframe(analysis.open_summary, use_container_width=True)
-                        st.caption(f"开仓头寸汇总 ({len(analysis.open_summary)}个商品-月份组合)")
-                        
-                        # 显示开仓加权平均价格
-                        st.subheader("开仓加权平均价格汇总")
-                        for _, row in analysis.open_summary.iterrows():
-                            st.write(f"**{row['Commodity']} - {row['Month']}**: "
-                                    f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
-                    else:
-                        st.info("无开仓头寸数据")
-                
-                with tabs[1]:
-                    if not analysis.close_summary.empty:
-                        st.dataframe(analysis.close_summary, use_container_width=True)
-                        st.caption(f"平仓头寸汇总 ({len(analysis.close_summary)}个商品-月份组合)")
-                        
-                        # 显示平仓加权平均价格
-                        st.subheader("平仓加权平均价格汇总")
-                        for _, row in analysis.close_summary.iterrows():
-                            st.write(f"**{row['Commodity']} - {row['Month']}**: "
-                                    f"{row['总数量']:,.0f}桶 @ ${row['加权平均价格']:.2f}")
-                    else:
-                        st.info("无平仓头寸数据")
-            else:
-                st.info("暂无头寸汇总数据")
-        
-        # 3. 匹配明细表
         if not analysis.df_relations.empty:
+            st.markdown("---")
+            st.markdown('<h2 class="sub-header">📊 匹配分析结果</h2>', unsafe_allow_html=True)
+            
+            # 1. 概览指标
+            analysis.create_summary_metrics()
+            
+            # 2. 匹配明细表
             st.markdown('<h3 class="sub-header">📋 匹配明细表</h3>', unsafe_allow_html=True)
             
             # 添加筛选器
@@ -1019,16 +990,38 @@ def main():
             # 显示筛选后的数据
             st.dataframe(filtered_df.head(max_rows), use_container_width=True)
             st.caption(f"显示 {len(filtered_df.head(max_rows))} 条记录，共 {len(filtered_df)} 条匹配记录 (筛选后)")
-        
-        # 4. 数据导出
-        st.markdown("---")
-        st.markdown('<h3 class="sub-header">💾 数据导出</h3>', unsafe_allow_html=True)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            # 导出匹配结果
-            if not analysis.df_relations.empty:
+            
+            # 3. 头寸汇总表（开仓/平仓加权均价）
+            if show_positions:
+                st.markdown('<h3 class="sub-header">⚖️ 头寸汇总与加权平均价格</h3>', unsafe_allow_html=True)
+                
+                if not analysis.open_summary.empty or not analysis.close_summary.empty:
+                    tabs = st.tabs(["开仓汇总", "平仓汇总"])
+                    
+                    with tabs[0]:
+                        if not analysis.open_summary.empty:
+                            st.dataframe(analysis.open_summary, use_container_width=True)
+                            st.caption(f"开仓头寸汇总 ({len(analysis.open_summary)}个商品-月份组合)")
+                        else:
+                            st.info("无开仓头寸数据")
+                    
+                    with tabs[1]:
+                        if not analysis.close_summary.empty:
+                            st.dataframe(analysis.close_summary, use_container_width=True)
+                            st.caption(f"平仓头寸汇总 ({len(analysis.close_summary)}个商品-月份组合)")
+                        else:
+                            st.info("无平仓头寸数据")
+                else:
+                    st.info("暂无头寸汇总数据")
+            
+            # 4. 数据导出
+            st.markdown("---")
+            st.markdown('<h3 class="sub-header">💾 数据导出</h3>', unsafe_allow_html=True)
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                # 导出匹配结果
                 csv_data = analysis.df_relations.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 匹配结果",
@@ -1037,43 +1030,42 @@ def main():
                     mime="text/csv",
                     use_container_width=True
                 )
-        
-        with col2:
-            # 导出开仓汇总
-            if not analysis.open_summary.empty:
-                open_csv = analysis.open_summary.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⚖️ 开仓汇总",
-                    data=open_csv,
-                    file_name=f"open_positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-        
-        with col3:
-            # 导出平仓汇总
-            if not analysis.close_summary.empty:
-                close_csv = analysis.close_summary.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⚖️ 平仓汇总",
-                    data=close_csv,
-                    file_name=f"close_positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-        
-        with col4:
-            # 导出所有数据
-            @st.cache_data
-            def convert_to_excel(df_dict):
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    for sheet_name, df in df_dict.items():
-                        if df is not None and not df.empty:
-                            df.to_excel(writer, sheet_name=sheet_name, index=False)
-                return output.getvalue()
             
-            if not analysis.df_relations.empty:
+            with col2:
+                # 导出开仓汇总
+                if not analysis.open_summary.empty:
+                    open_csv = analysis.open_summary.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="⚖️ 开仓汇总",
+                        data=open_csv,
+                        file_name=f"open_positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            
+            with col3:
+                # 导出平仓汇总
+                if not analysis.close_summary.empty:
+                    close_csv = analysis.close_summary.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="⚖️ 平仓汇总",
+                        data=close_csv,
+                        file_name=f"close_positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            
+            with col4:
+                # 导出所有数据
+                @st.cache_data
+                def convert_to_excel(df_dict):
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        for sheet_name, df in df_dict.items():
+                            if df is not None and not df.empty:
+                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    return output.getvalue()
+                
                 excel_data = convert_to_excel({
                     "匹配结果": analysis.df_relations,
                     "开仓汇总": analysis.open_summary,
@@ -1089,6 +1081,12 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
+        else:
+            st.markdown('<div class="info-box">📊 匹配完成，但未找到匹配记录</div>', unsafe_allow_html=True)
+            st.info("建议检查：")
+            st.write("1. 确认指定日期是否正确")
+            st.write("2. 检查纸货和实货的商品名称是否一致")
+            st.write("3. 确认实货数据中有需要匹配的头寸")
     
     else:
         # 欢迎页面
